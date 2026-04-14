@@ -21,8 +21,8 @@ Updated automatically at 6:30 AM ET on trading days via GitHub Actions.
 
 Raw URLs for programmatic access:
 ```
-https://raw.githubusercontent.com/haus-edge/gex-levels/main/data/gex_SPX.txt
-https://raw.githubusercontent.com/haus-edge/gex-levels/main/data/gex_QQQ.txt
+https://raw.githubusercontent.com/haus-edge/gex-levels/master/data/gex_SPX.txt
+https://raw.githubusercontent.com/haus-edge/gex-levels/master/data/gex_QQQ.txt
 ```
 
 ## How It Works
