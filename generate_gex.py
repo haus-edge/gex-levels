@@ -56,6 +56,12 @@ INDEX_MAP = {
     "QQQ": "^NDX",    # Nasdaq-100 — NQ futures trade at this level
 }
 
+# Map ETF -> volatility index ticker (for Edge Levels expected move)
+VIX_MAP = {
+    "SPY": "^VIX",    # VIX for ES/SPX
+    "QQQ": "^VXN",    # VXN for NQ/NDX
+}
+
 
 def bs_gamma(S, K, T, r, sigma):
     """Vectorized Black-Scholes gamma."""
@@ -324,6 +330,17 @@ def compute_gex_levels(symbol, max_dte=MAX_DTE):
         except Exception as e:
             print(f"  Warning: could not fetch {index_ticker}, levels stay in ETF space: {e}")
 
+    # --- Fetch volatility index close (VIX/VXN) for Edge Levels study ---
+    vol_close = 0.0
+    vol_ticker = VIX_MAP.get(symbol)
+    if vol_ticker:
+        try:
+            vt = yf.Ticker(vol_ticker)
+            vol_close = vt.fast_info["previousClose"]
+            print(f"  {vol_ticker} previous close: {vol_close:.2f}")
+        except Exception as e:
+            print(f"  Warning: could not fetch {vol_ticker}: {e}")
+
     return {
         "symbol": out_symbol,
         "underlying": float(spot),
@@ -337,6 +354,9 @@ def compute_gex_levels(symbol, max_dte=MAX_DTE):
         "etf_gamma_flip": etf_gamma_flip,
         "etf_call_wall": etf_call_wall,
         "etf_put_wall": etf_put_wall,
+        # Volatility index close for Edge Levels study
+        "vol_close": float(vol_close),
+        "vol_ticker": vol_ticker or "",
     }
 
 
@@ -357,6 +377,11 @@ def write_gex_file(data):
         f.write(f"ETF_GAMMA_FLIP={data['etf_gamma_flip']:.2f}\n")
         f.write(f"ETF_CALL_WALL={data['etf_call_wall']:.2f}\n")
         f.write(f"ETF_PUT_WALL={data['etf_put_wall']:.2f}\n")
+        # Volatility index close for Edge Levels expected move
+        if data.get('vol_close', 0) > 0:
+            # VIX_CLOSE for SPX, VXN_CLOSE for QQQ
+            vol_key = "VXN_CLOSE" if data['symbol'] == "QQQ" else "VIX_CLOSE"
+            f.write(f"{vol_key}={data['vol_close']:.2f}\n")
     print(f"  Wrote {path}")
 
 
