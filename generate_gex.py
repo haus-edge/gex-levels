@@ -1,11 +1,14 @@
 """
-generate_gex.py - Compute GEX levels from Yahoo Finance options data
+generate_gex.py - Compute proxy GEX levels from Yahoo Finance options data
 
 Downloads options chains for SPY and QQQ via yfinance, computes gamma
 exposure per strike using Black-Scholes, and derives key levels:
   - Gamma Flip: spot price where net dealer GEX crosses zero
   - Call Wall:  strike with highest call gamma concentration (resistance)
   - Put Wall:   strike with highest put gamma concentration (support)
+
+These are ETF-derived proxy levels, not true SPX/NDX index option GEX.
+Levels are converted to index price space for ES/NQ chart overlay.
 
 Improvements over naive GEX:
   - DTE-weighted OI (exp decay, tau=14d) — near-term gamma dominates
@@ -114,12 +117,17 @@ def collect_chain(ticker, spot, max_dte):
 
 
 def compute_per_strike_gex(arr, spot, sign=1.0):
-    """Aggregate GEX by strike. Returns {strike: total_gex}."""
+    """Aggregate dollar gamma per 1% move by strike.
+
+    Uses: sign * gamma * OI * 100 * S^2 * 0.01
+    This is the standard institutional scaling for dollar gamma exposure.
+    Calls get sign=+1 (dealers long gamma), puts get sign=-1 (dealers short gamma).
+    """
     if len(arr) == 0:
         return {}
     K, OI, T, IV = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
     gamma = bs_gamma(spot, K, T, RISK_FREE_RATE, IV)
-    gex = sign * gamma * OI * 100 * spot
+    gex = sign * gamma * OI * 100 * spot * spot * 0.01
     result = {}
     for i in range(len(K)):
         result[K[i]] = result.get(K[i], 0.0) + gex[i]
@@ -127,7 +135,12 @@ def compute_per_strike_gex(arr, spot, sign=1.0):
 
 
 def compute_skew_slope(calls, puts, spot):
-    """Compute empirical ATM skew slope (dIV/dStrike) from near-ATM puts."""
+    """Compute empirical ATM skew slope (dIV/dStrike) from near-ATM puts.
+
+    Returns a negative number for typical equity index skew.
+    Used as a linear approximation — real skew is nonlinear, so treat
+    the resulting gamma flip as a smoothed proxy, not a precise level.
+    """
     if len(puts) == 0:
         return 0.0
 
@@ -145,7 +158,11 @@ def compute_skew_slope(calls, puts, spot):
 
 
 def find_gamma_flip(calls, puts, spot, skew_slope):
-    """Find gamma flip with skew-corrected IV."""
+    """Find gamma flip with skew-corrected IV.
+
+    Sweeps hypothetical spot levels and computes net GEX at each using
+    S^2 * 0.01 scaling. The zero crossing nearest current spot is the flip.
+    """
     if len(calls) == 0 and len(puts) == 0:
         return spot
 
@@ -177,7 +194,7 @@ def find_gamma_flip(calls, puts, spot, skew_slope):
             gamma = norm.pdf(d1) / (S * IV_adj * sqrt_T)
             gamma = np.nan_to_num(gamma, nan=0.0, posinf=0.0, neginf=0.0)
 
-        gex = gamma * OI_b * 100 * S
+        gex = gamma * OI_b * 100 * S * S * 0.01
         net_gex += sign * np.sum(gex, axis=1)
 
     sign_changes = np.where(np.diff(np.sign(net_gex)))[0]
@@ -193,10 +210,15 @@ def find_gamma_flip(calls, puts, spot, skew_slope):
     return float(spot)
 
 
-def read_previous_walls(symbol):
-    """Read previous call/put wall from existing file for hysteresis."""
-    path = os.path.join(OUTPUT_DIR, f"gex_{symbol}.txt")
-    prev = {"CALL_WALL": 0.0, "PUT_WALL": 0.0}
+def read_previous_etf_walls(symbol):
+    """Read previous ETF-space walls from existing file for hysteresis.
+
+    These are the raw ETF strikes before index conversion, stored as
+    ETF_CALL_WALL / ETF_PUT_WALL in the output file.
+    """
+    out_symbol = {"SPY": "SPX"}.get(symbol, symbol)
+    path = os.path.join(OUTPUT_DIR, f"gex_{out_symbol}.txt")
+    prev = {"ETF_CALL_WALL": 0.0, "ETF_PUT_WALL": 0.0}
     try:
         with open(path, "r") as f:
             for line in f:
@@ -208,16 +230,20 @@ def read_previous_walls(symbol):
                     prev[key] = float(val)
     except (FileNotFoundError, ValueError):
         pass
-    return prev["CALL_WALL"], prev["PUT_WALL"]
+    return prev["ETF_CALL_WALL"], prev["ETF_PUT_WALL"]
 
 
-def apply_hysteresis(new_gex_map, new_wall, prev_wall, is_put=False):
-    """Only move the wall if new candidate is >10% stronger than previous."""
-    if prev_wall == 0.0 or prev_wall not in new_gex_map:
+def apply_hysteresis(gex_map, new_wall, prev_wall):
+    """Only move the wall if new candidate is >10% stronger than previous.
+
+    Both new_wall and prev_wall must be in the same price space as gex_map
+    (ETF strikes). Comparison uses absolute GEX magnitude.
+    """
+    if prev_wall == 0.0 or prev_wall not in gex_map:
         return new_wall
 
-    new_strength = abs(new_gex_map[new_wall])
-    prev_strength = abs(new_gex_map.get(prev_wall, 0.0))
+    new_strength = abs(gex_map[new_wall])
+    prev_strength = abs(gex_map.get(prev_wall, 0.0))
 
     if prev_strength == 0:
         return new_wall
@@ -247,36 +273,43 @@ def compute_gex_levels(symbol, max_dte=MAX_DTE):
     if len(calls) == 0 and len(puts) == 0:
         raise ValueError(f"No options data for {symbol}")
 
-    # --- Per-strike GEX ---
+    # --- Per-strike GEX (ETF space) ---
     call_gex = compute_per_strike_gex(calls, spot, sign=+1.0)
     put_gex = compute_per_strike_gex(puts, spot, sign=-1.0)
 
-    # Raw wall candidates
+    # Raw wall candidates (ETF strikes)
+    # Call wall: strike with largest positive GEX
     raw_call_wall = max(call_gex, key=call_gex.get) if call_gex else 0.0
-    raw_put_wall = min(put_gex, key=put_gex.get) if put_gex else 0.0
+    # Put wall: strike with largest absolute negative GEX
+    raw_put_wall = max(put_gex, key=lambda k: abs(put_gex[k])) if put_gex else 0.0
 
-    # Hysteresis: compare against previous run's walls
-    out_symbol = {"SPY": "SPX"}.get(symbol, symbol)
-    prev_cw, prev_pw = read_previous_walls(out_symbol)
+    # Hysteresis: compare in ETF space against previous ETF-space walls
+    prev_cw, prev_pw = read_previous_etf_walls(symbol)
     call_wall = apply_hysteresis(call_gex, raw_call_wall, prev_cw)
-    put_wall = apply_hysteresis(put_gex, raw_put_wall, prev_pw, is_put=True)
+    put_wall = apply_hysteresis(put_gex, raw_put_wall, prev_pw)
 
     if call_wall != raw_call_wall:
-        print(f"  Call wall held at {prev_cw:.0f} (hysteresis — new candidate {raw_call_wall:.0f} not 10%+ stronger)")
+        print(f"  Call wall held at {prev_cw:.2f} (hysteresis — new candidate {raw_call_wall:.2f} not 10%+ stronger)")
     if put_wall != raw_put_wall:
-        print(f"  Put wall held at {prev_pw:.0f} (hysteresis — new candidate {raw_put_wall:.0f} not 10%+ stronger)")
+        print(f"  Put wall held at {prev_pw:.2f} (hysteresis — new candidate {raw_put_wall:.2f} not 10%+ stronger)")
 
-    # Net GEX
+    # Net GEX (relative, not institutional-grade absolute)
     net_gex = sum(call_gex.values()) + sum(put_gex.values())
     regime = "positive_gamma" if net_gex >= 0 else "negative_gamma"
 
-    # --- Skew-corrected gamma flip ---
+    # --- Skew-corrected gamma flip (ETF space) ---
     skew_slope = compute_skew_slope(calls, puts, spot)
     print(f"  ATM skew slope: {skew_slope:.6f} dIV/d$ (used for gamma flip correction)")
     print(f"  Computing gamma flip...")
     gamma_flip = find_gamma_flip(calls, puts, spot, skew_slope)
 
-    # --- Pre-convert to index/futures price space ---
+    # Save ETF-space walls for next run's hysteresis comparison
+    etf_call_wall = float(call_wall)
+    etf_put_wall = float(put_wall)
+    etf_gamma_flip = float(gamma_flip)
+
+    # --- Convert to index/futures price space ---
+    out_symbol = {"SPY": "SPX"}.get(symbol, symbol)
     index_ticker = INDEX_MAP.get(symbol)
     if index_ticker:
         try:
@@ -300,6 +333,10 @@ def compute_gex_levels(symbol, max_dte=MAX_DTE):
         "call_wall": float(call_wall),
         "put_wall": float(put_wall),
         "net_gex": float(net_gex),
+        # ETF-space values for hysteresis on next run
+        "etf_gamma_flip": etf_gamma_flip,
+        "etf_call_wall": etf_call_wall,
+        "etf_put_wall": etf_put_wall,
     }
 
 
@@ -316,6 +353,10 @@ def write_gex_file(data):
         f.write(f"CALL_WALL={data['call_wall']:.2f}\n")
         f.write(f"PUT_WALL={data['put_wall']:.2f}\n")
         f.write(f"NET_GEX={data['net_gex']:.0f}\n")
+        # ETF-space walls for hysteresis stability across runs
+        f.write(f"ETF_GAMMA_FLIP={data['etf_gamma_flip']:.2f}\n")
+        f.write(f"ETF_CALL_WALL={data['etf_call_wall']:.2f}\n")
+        f.write(f"ETF_PUT_WALL={data['etf_put_wall']:.2f}\n")
     print(f"  Wrote {path}")
 
 
