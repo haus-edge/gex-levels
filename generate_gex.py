@@ -283,6 +283,22 @@ def compute_gex_levels(symbol, max_dte=MAX_DTE):
     call_gex = compute_per_strike_gex(calls, spot, sign=+1.0)
     put_gex = compute_per_strike_gex(puts, spot, sign=-1.0)
 
+    # --- Separate call/put GEX profiles (ETF space) ---
+    # Top 10 call strikes (positive gamma, green bars)
+    top_call_strikes = sorted(call_gex, key=lambda s: call_gex[s], reverse=True)[:10]
+    # Top 10 put strikes by magnitude (negative gamma, red bars)
+    top_put_strikes = sorted(put_gex, key=lambda s: abs(put_gex[s]), reverse=True)[:10]
+    # Combine: if a strike is in both lists, keep whichever side has higher magnitude
+    profile_by_strike = {}
+    for s in top_call_strikes:
+        profile_by_strike[s] = call_gex[s]
+    for s in top_put_strikes:
+        if s in profile_by_strike:
+            if abs(put_gex[s]) > abs(profile_by_strike[s]):
+                profile_by_strike[s] = put_gex[s]
+        else:
+            profile_by_strike[s] = put_gex[s]
+
     # Raw wall candidates (ETF strikes)
     # Call wall: strike with largest positive GEX
     raw_call_wall = max(call_gex, key=call_gex.get) if call_gex else 0.0
@@ -317,6 +333,7 @@ def compute_gex_levels(symbol, max_dte=MAX_DTE):
     # --- Convert to index/futures price space ---
     out_symbol = {"SPY": "SPX"}.get(symbol, symbol)
     index_ticker = INDEX_MAP.get(symbol)
+    ratio = 1.0
     if index_ticker:
         try:
             idx = yf.Ticker(index_ticker)
@@ -329,6 +346,13 @@ def compute_gex_levels(symbol, max_dte=MAX_DTE):
             spot = index_price
         except Exception as e:
             print(f"  Warning: could not fetch {index_ticker}, levels stay in ETF space: {e}")
+
+    # Convert profile strikes to index space
+    gex_profile = sorted(
+        [(round(s * ratio), int(profile_by_strike[s])) for s in profile_by_strike],
+        key=lambda p: p[0],
+    )
+    print(f"  GEX profile: {len(gex_profile)} strikes ({sum(1 for _, g in gex_profile if g > 0)} call, {sum(1 for _, g in gex_profile if g < 0)} put)")
 
     # --- Fetch volatility index close (VIX/VXN) for Edge Levels study ---
     vol_close = 0.0
@@ -357,6 +381,8 @@ def compute_gex_levels(symbol, max_dte=MAX_DTE):
         # Volatility index close for Edge Levels study
         "vol_close": float(vol_close),
         "vol_ticker": vol_ticker or "",
+        # Per-strike GEX profile (top 20 by magnitude, index space)
+        "gex_profile": gex_profile,
     }
 
 
@@ -382,6 +408,11 @@ def write_gex_file(data):
             # VIX_CLOSE for SPX, VXN_CLOSE for QQQ
             vol_key = "VXN_CLOSE" if data['symbol'] == "QQQ" else "VIX_CLOSE"
             f.write(f"{vol_key}={data['vol_close']:.2f}\n")
+        # Per-strike GEX profile for histogram visualization
+        profile = data.get('gex_profile', [])
+        if profile:
+            pairs = ",".join(f"{strike}:{gex}" for strike, gex in profile)
+            f.write(f"GEX_PROFILE={pairs}\n")
     print(f"  Wrote {path}")
 
 
