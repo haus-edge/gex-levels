@@ -89,6 +89,34 @@ def _load_massive_key():
 MASSIVE_KEY = _load_massive_key()
 
 
+def _load_schwab_creds():
+    """Load Schwab OAuth creds from env or .env file. Returns (client_id, secret, callback) or Nones."""
+    cid = os.environ.get("SCHWAB_CLIENT_ID")
+    sec = os.environ.get("SCHWAB_CLIENT_SECRET")
+    cb = os.environ.get("SCHWAB_CALLBACK_URL", "https://127.0.0.1")
+    if cid and sec:
+        return cid, sec, cb
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_path):
+        vals = {}
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                for key in ("SCHWAB_CLIENT_ID", "SCHWAB_CLIENT_SECRET", "SCHWAB_CALLBACK_URL"):
+                    if line.startswith(key + "="):
+                        vals[key] = line.split("=", 1)[1].strip().strip("'\"")
+        cid = vals.get("SCHWAB_CLIENT_ID")
+        sec = vals.get("SCHWAB_CLIENT_SECRET")
+        cb = vals.get("SCHWAB_CALLBACK_URL", "https://127.0.0.1")
+        if cid and sec:
+            return cid, sec, cb
+    return None, None, None
+
+
+SCHWAB_ID, SCHWAB_SECRET, SCHWAB_CALLBACK = _load_schwab_creds()
+SCHWAB_TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".schwab_token.json")
+
+
 # ---------------------------------------------------------------------------
 # Black-Scholes gamma
 # ---------------------------------------------------------------------------
@@ -169,6 +197,121 @@ def fetch_tradier(today_str):
             "implied_volatility": float(opt.get("greeks", {}).get("mid_iv") or 0),
             "greeks": opt.get("greeks"),  # pre-computed gamma etc.
         })
+    return spot, normalized
+
+
+# ---------------------------------------------------------------------------
+# Data source: Schwab (free, real-time, OAuth 2.0)
+# ---------------------------------------------------------------------------
+
+def _schwab_refresh_token():
+    """Refresh the Schwab access token using the refresh token."""
+    import json, base64
+    import requests as req
+
+    with open(SCHWAB_TOKEN_PATH, "r") as f:
+        token_data = json.load(f)
+
+    auth_str = base64.b64encode(f"{SCHWAB_ID}:{SCHWAB_SECRET}".encode()).decode()
+    resp = req.post(
+        "https://api.schwabapi.com/v1/oauth/token",
+        headers={"Authorization": f"Basic {auth_str}",
+                 "Content-Type": "application/x-www-form-urlencoded"},
+        data={"grant_type": "refresh_token",
+              "refresh_token": token_data["refresh_token"]},
+    )
+    resp.raise_for_status()
+    new_token = resp.json()
+    # Preserve refresh_token if not returned in refresh response
+    if "refresh_token" not in new_token:
+        new_token["refresh_token"] = token_data["refresh_token"]
+    with open(SCHWAB_TOKEN_PATH, "w") as f:
+        json.dump(new_token, f)
+    return new_token["access_token"]
+
+
+def _schwab_get_access_token():
+    """Get a valid Schwab access token, refreshing if needed."""
+    import json
+
+    if not os.path.exists(SCHWAB_TOKEN_PATH):
+        raise FileNotFoundError("No Schwab token — run: python schwab_auth.py")
+
+    with open(SCHWAB_TOKEN_PATH, "r") as f:
+        token_data = json.load(f)
+
+    # Try the existing access token first, refresh if it fails
+    return token_data["access_token"]
+
+
+def fetch_schwab(today_str):
+    """Fetch SPY spot + 0DTE chain from Schwab. Returns (spot, chain)."""
+    import requests as req
+
+    token = _schwab_get_access_token()
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+    resp = req.get(
+        "https://api.schwabapi.com/marketdata/v1/chains",
+        params={"symbol": "SPY", "fromDate": today_str, "toDate": today_str},
+        headers=headers,
+        timeout=15,
+    )
+
+    # If 401, refresh token and retry once
+    if resp.status_code == 401:
+        print("  Schwab: Token expired, refreshing...")
+        token = _schwab_refresh_token()
+        headers["Authorization"] = f"Bearer {token}"
+        resp = req.get(
+            "https://api.schwabapi.com/marketdata/v1/chains",
+            params={"symbol": "SPY", "fromDate": today_str, "toDate": today_str},
+            headers=headers,
+            timeout=15,
+        )
+
+    resp.raise_for_status()
+    data = resp.json()
+
+    spot = data.get("underlyingPrice") or data.get("underlying", {}).get("last")
+    if not spot:
+        raise ValueError("Schwab: no underlying price in response")
+    spot = float(spot)
+
+    normalized = []
+    for map_key, opt_type in [("callExpDateMap", "call"), ("putExpDateMap", "put")]:
+        exp_map = data.get(map_key, {})
+        for exp_date, strikes in exp_map.items():
+            for strike_str, contracts in strikes.items():
+                for opt in contracts:
+                    strike = float(opt.get("strikePrice", 0))
+                    if strike <= 0:
+                        continue
+
+                    oi = int(opt.get("openInterest", 0))
+                    vol = int(opt.get("totalVolume", 0))
+                    iv = float(opt.get("volatility", 0)) / 100.0  # Schwab returns %
+
+                    greeks_dict = None
+                    delta = opt.get("delta")
+                    gamma = opt.get("gamma")
+                    if delta is not None or gamma is not None:
+                        greeks_dict = {
+                            "delta": float(delta) if delta is not None else None,
+                            "gamma": float(gamma) if gamma is not None else None,
+                            "theta": float(opt["theta"]) if opt.get("theta") is not None else None,
+                            "vega": float(opt["vega"]) if opt.get("vega") is not None else None,
+                        }
+
+                    normalized.append({
+                        "strike": strike,
+                        "open_interest": oi,
+                        "volume": vol,
+                        "option_type": opt_type,
+                        "implied_volatility": iv,
+                        "greeks": greeks_dict,
+                    })
+
     return spot, normalized
 
 
@@ -589,8 +732,11 @@ def write_output(data):
 def main():
     today = datetime.now().strftime("%Y-%m-%d")
 
-    # Pick data source
-    if MASSIVE_KEY:
+    # Pick data source: Schwab → Massive → Tradier → yfinance
+    if SCHWAB_ID:
+        source = "Schwab"
+        print(f"0DTE GEX Calculator (Schwab) — {today}\n")
+    elif MASSIVE_KEY:
         source = "Massive"
         print(f"0DTE GEX Calculator (Massive) — {today}\n")
     elif API_KEY:
@@ -599,20 +745,32 @@ def main():
     else:
         source = "yfinance"
         print(f"0DTE GEX Calculator (yfinance) — {today}")
-        print(f"  (Set MASSIVE_API_KEY or TRADIER_API_KEY for live data)\n")
+        print(f"  (Set SCHWAB_CLIENT_ID for free real-time data)\n")
 
     # 1. Fetch SPY spot + 0DTE chain
     print("  Fetching SPY quote + 0DTE chain...")
     try:
-        if source == "Massive":
+        if source == "Schwab":
+            spy_spot, chain = fetch_schwab(today)
+        elif source == "Massive":
             spy_spot, chain = fetch_massive(today)
         elif source == "Tradier":
             spy_spot, chain = fetch_tradier(today)
         else:
             spy_spot, chain = fetch_yfinance(today)
     except Exception as e:
-        print(f"  Error fetching data: {e}")
-        sys.exit(1)
+        if source != "yfinance":
+            print(f"  {source} failed: {e}")
+            print(f"  Falling back to yfinance...")
+            source = "yfinance"
+            try:
+                spy_spot, chain = fetch_yfinance(today)
+            except Exception as e2:
+                print(f"  yfinance also failed: {e2}")
+                sys.exit(1)
+        else:
+            print(f"  Error fetching data: {e}")
+            sys.exit(1)
 
     print(f"  SPY spot: ${spy_spot:.2f}")
 
